@@ -1,0 +1,644 @@
+---
+title: 'Risk Score from Survival Random Forest Predicts Lower ICU Admission Among Patients'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+
+# load packages, if not, download and load  
+pkg <- c("cowplot", "zoo", "dplyr", "tidyverse", "janitor",
+         "survival", "ranger", "pec", "caret", "reshape2", "gridExtra", "ggpubr", 
+         "knitr")
+
+for (i in pkg) {
+  if (pkg %in% installed.packages()[, "Package"] == FALSE) {
+    install.package(i)
+  } else {
+    library(i, character.only = TRUE)
+  }
+}
+
+# data loaded from the same working directory
+data_log <- read_csv("ICU_data_logs.csv")
+data_etc <- read_csv("ICU_data_event.csv")
+```
+```{r echo = FALSE}
+
+# data cleaning
+# create a for-loop converting the field columns into multiple columns
+compressed_data <- data.frame(id = numeric(50304), time = character(50304),
+                              rr = rep(NA, 50304), sp02_perc = rep(NA, 50304),
+                              air = rep(NA, 50304), sbp_mmhg = rep(NA, 50304),
+                              pulse_rate = rep(NA, 50304), alert = rep(NA, 50304),
+                              temperature = rep(NA, 50304), news = rep(NA, 50304))
+
+# index of the data_log
+i <- 1
+
+# row number of new table
+rownum <- 1
+
+while (i < nrow(data_log)) {
+  compressed_data$id[rownum] <- data_log$id[i]
+  compressed_data$time[rownum] <- data_log$Time[i]
+  if (data_log$Field[i] == "Respirationrate_perminute") {
+    compressed_data$rr[rownum] <- data_log$Value[i]
+  } else if (data_log$Field[i] == "SpO2_perc") {
+    compressed_data$sp02_perc[rownum] <- data_log$Value[i]
+  } else if(data_log$Field[i] == "Air") {
+    compressed_data$air[rownum] <- data_log$Value[i]
+  } else if(data_log$Field[i] == "SBP_mmHg") {
+    compressed_data$sbp_mmhg[rownum] <- data_log$Value[i]
+  } else if(data_log$Field[i] == "Alert") {
+    compressed_data$alert[rownum] <- data_log$Value[i]
+  } else if(data_log$Field[i] == "Temperature_Celsius") {
+    compressed_data$temperature[rownum] <- data_log$Value[i]
+  } else if(data_log$Field[i] == "NEWS") {
+    compressed_data$news[rownum] <- data_log$Value[i]
+  } else {
+    compressed_data$pulse_rate[rownum] <- data_log$Value[i]
+  }
+
+
+  if (compressed_data$time[rownum] != data_log$Time[i+1]
+      || compressed_data$id[rownum] != data_log$id[i+1]) {
+    rownum <- rownum + 1
+  }
+
+  i <- i + 1
+}
+
+# to compute the last cell manually
+compressed_data$id[rownum] <- data_log$id[i]
+compressed_data$time[rownum] <- data_log$Time[i]
+
+if (data_log$Field[i] == "Respirationrate_perminute") {
+  compressed_data$rr[rownum] <- data_log$Value[i]
+} else if (data_log$Field[i] == "SpO2_perc") {
+  compressed_data$sp02_perc[rownum] <- data_log$Value[i]
+} else if(data_log$Field[i] == "Air") {
+  compressed_data$air[rownum] <- data_log$Value[i]
+} else if(data_log$Field[i] == "SBP_mmHg") {
+  compressed_data$sbp_mmhg[rownum] <- data_log$Value[i]
+} else if(data_log$Field[i] == "Alert") {
+  compressed_data$alert[rownum] <- data_log$Value[i]
+} else if(data_log$Field[i] == "Temperature_Celsius") {
+  compressed_data$temperature[rownum] <- data_log$Value[i]
+} else if(data_log$Field[i] == "NEWS") {
+  compressed_data$news[rownum] <- data_log$Value[i]
+} else {
+  compressed_data$pulse_rate[rownum] <- data_log$Value[i]
+}
+
+# full data combining both csv files
+suppressMessages(data_full <- left_join(compressed_data, data_etc))
+
+# determine time it took for each patient (until discharge) in terms of time diff
+# from (0 ~ time of discharge)
+
+data_full$time <- strptime(data_full$time, format = "%Y-%m-%d %H")
+startTime <- aggregate(data_full$time, by = list(data_full$id), min)
+data_full <- merge(data_full, startTime, by.x = 1, by.y = 1)
+names(data_full)[names(data_full) == "x"] <- "start_time"
+
+data_full$eventtime_in_days <- data_full %>% transmute(eventtime_in_days = round(difftime(time, start_time, units = "days"),2))
+data_full <- data_full %>% mutate(eventtime_in_days = as.double(eventtime_in_days$eventtime_in_days))
+data_full <- data_full %>% select(-last_col())
+
+data_full$rr <- na.locf(data_full$rr)
+data_full$sp02_perc <- na.locf(data_full$sp02_perc)
+data_full$air <- na.locf(data_full$air)
+data_full$sbp_mmhg <- na.locf(data_full$sbp_mmhg)
+data_full$pulse_rate <- na.locf(data_full$pulse_rate)
+data_full$alert <- na.locf(data_full$alert)
+data_full$temperature <- na.locf(data_full$temperature)
+data_full$news <- na.locf(data_full$news)
+
+# data with proper labels to be used solely for visualization purposes
+data_full_names <- data_full
+colnames(data_full_names) <- c("ID", "Time", "Respiration Rate" , "Oxygen Saturation", "Supplementary Oxygen",
+              "Blood Pressure", "Heart Rate", "Level of Consciousness", "Temperature",
+              "Risk Score", "Sex", "Age", "Event Time", "Status" )
+
+# convert the relevant variables to be of type Factor
+data_full_names <- clean_names(data_full_names)
+data_full_names$sex <- as.factor(data_full_names$sex)
+data_full_names$supplementary_oxygen <- 
+  as.factor(data_full_names$supplementary_oxygen)
+data_full_names$level_of_consciousness <- 
+  as.factor(data_full_names$level_of_consciousness)
+data_full_names$risk_score <- as.factor(data_full_names$risk_score)
+data_full_names$status <- as.factor(data_full_names$status)
+
+```
+
+\newpage
+
+### Abstract
+
+ICU (Intensive Care Unit) is a hospital ward specifically used to assist patients who are at the highest risk of death. The COVID-19 pandemic has taught us once again the need to best handle situations where the number of patients in need of intensive care far exceeds the number of ICU beds available. Physicians must be able to make decisions based on some type of "risk" analysis method to prioritize patients needing the ICU beds the most. This study aimed to obtain an "optimal" score that best identifies subjects with a high risk of being admitted into ICU using a state-of-the-art machine learning tool. Fourteen Survival random forests were built to simulate patients' chances of survival each day. A new risk score was constructed by taking a complement of an aggregate survival chance for each observation based on each iteration of the model. The analysis revealed the new risk score to illustrate milder risk than the existing risk score with most of the patients being deemed only moderately at risk. The prediction accuracies for each iteration of the forest also ranged between 53% to 94%. The study also explored which health biomarkers more useful in predicting risk based on the survival random forest. The result produced by the models revealed factors such as temperature, age, heart rate, oxygen saturation, and respiration rates to be most significant in accurately predicting patients' risk of ICU admission.
+
+### Introduction
+
+  The term ICU has grown familiar to us over the past two year ever since COVID-19 was first declared a pandemic in March 2020. ICU stands for Intensive Care Unit, and it is an equipment most often used as a last resort method to keep patients alive when their body fails to do so. One of the biggest concerns during the height of the pandemic was the massive shortage of ICU beds due to an exponential rise of cases worldwide. During such cases, doctors must decide which patients should be given priority based on their “risk score”. Risk score, in our context, is thus defined as a metric that determines a patient’s current/future likelihood of requiring a serious medical attention (ICU admission). Knowing patients’ risk score can not only inform doctors on who needs most urgent attention, but it can also act as an intervention against future hospital visits. 
+  
+  This study aimed to explore an “optimal” risk score that best identified patients with an increased risk of ICU admission. It has also identified which health biomarkers are most significant in predicting patient risk as well as comparing the existing risk score with the new risk score. The study has constructed a risk score framework using aggregated survival functions generated from a machine learning technique called survival random forest. The method section has outline the logistic of the survival random forest used including its formula, cross-validation approaches and risk score construction. The result section then showed that the survival curves produced from the forest are consistent with our findings in the EDA, visually compared new risk score versus old risk score, and illustrated covariates deemed important by the model. Finally, the discussion section gave explanation for the behavior shown by the new risk score and explained possible limitations.
+
+\newpage
+
+### Methods
+
+  The data was collected from 900 patients over a course of zero to thirteen days until the patients were either discharged from the hospital or admitted to the ICU. Status of the patients’ health indicators were recorded every four hours. Recorded health indicators used for the study include patients’ oxygen level (%), number of breaths per minute, whether the patient required supplementary oxygen (supplementary oxygen = 1), blood pressure (mm Hg), heart rate, patients’ consciousness, temperature (Celsius), and whether the patient had been admitted to the ICU beds (status = 1). Other factors such as age, sex (female = 1, male = 0), risk score used to measure current patients’ risk, and duration of stay were also included in the study.
+
+  
+```{r echo = FALSE}
+
+#creating table of (variable) info
+variable <- c("ID", "Time", "Respiration Rate", "Oxygen Saturation (Percentage)", "Supplementary Oxygen", 
+              "Systolic Blood Pressure (mm Hg)", "Heart Rate", "Level of Consciousness", "Temperature (Celsius)", 
+              "Risk Score", "Sex", "Age", "Event Time", "Status" )
+explaination <- c("Patient ID", "Time of record", "Number of breaths per minute" , "Percentage of oxygen travelling throughout the body", 
+                  "Whether the patient is breathing normally", "Blood pressure measured during heart beats", 
+                  "Number of heart beats per minute", "Whether the patient is conscious or unscious",
+                  "Patient temperature in celsius", "Risk score derived from the variables combined", 
+                  "Sex of the patient", "Age of the patient", "Duration of patient stay in hopsital bed in days", 
+                  "Whether the patient has experienced a serious event")
+table_info <- data.frame(variable, explaination)
+knitr::kable(table_info, caption = "List of variables involved")
+
+```
+
+  All missing values have also been replaced to reflect that of their previous value. For example, if one of the observations was missing the patient's sex at a particular time stamp due to a technical error, then the missing value would be replaced with the value of its previous time stamp. This decision was made knowing that observations were frequently updated (every four hours), and thus the missing value will most likely be identical to its previous observation. In addition, no missing values were ever found within patients' first observations meaning that current imputation method is sufficient for the given data. 
+	
+  Data on patients’ health indicators were also combined to better illustrate the change in patients’ health over time. Rows containing Patients’ health status were reduced based on time in which the records were updated and the data on patients’ age, sex and total duration of stay were also combined with the patients' health data.
+
+A survival random forest was used in the study to answer the aforementioned research questions. By definition, survival random forest is a non-parametric machine learning method used to build prediction models using an ensemble of simulated survival trees (Mogensen et al., 2012). The following steps were taken to build a survival random forest in context to the ICU data: 
+
+  1.	First, $B$ bootstrap samples were selected at random with replacement. 
+  
+  2.	A survival tree is built using one of the bootstrap samples with a random subset of covariates (e.g., temperature, sex, age, etc.) as nodes
+        + when a tree is built, the node splits are determined with regards to the right-censored data (e.g., log-rank test) (Mogensen et al., 2012).
+  
+  3. This step is repeated $B$ times using a new bootstrap sample each time.
+
+Right censoring is appropriate for this study since we do not know what happened after the last recorded stay of the patient. In this usage of survival random forest, 500 bootstrap samples were taken ($B = 500$) to build a random forest. A survival prediction ensemble is then calculated using the aggregate information from the leaves of the trees (Mogensen et al., 2012). In each leaf, a conditional cumulative hazard function (*CHF*) is estimated using the Nelson-Aalen estimator from the bootstrapped data. 
+
+  $\widehat{H}_{b}(t|x) = \int^t_0\frac{\tilde{N}_b(ds, x)}{\tilde{Y}_b(s,x)}$
+  
+Where: 
+
+  + $b$ stands for the $b^{th}$ bootstrap
+  
+  + $x$ stands for the predictor
+  
+  + $\tilde{N}_b(ds, x)$ represents the uncensored event until time $s$ 
+  
+  + $\tilde{Y}_b(s,x)$ represents the number at risk at time $s$
+
+Lastly, the ensemble survival function is then obtained from aggregating the Nelson-Aalen estimate from all the leaves (i.e., $\widehat{H}_{b}(t|x)$).
+
+  $\widehat{S}^{rsf}(t|x) = exp(-\frac{1}{B}\sum^B_{b=1}\widehat{H}_{b}(t|x))$
+
+This function is then used to predict the response of interest (i.e., the likelihood of experiencing a serious event or Status). 
+
+Survival random forest was used in this study for the following reasons: Firstly, random forest is a time-efficient tool that also produces highly accurate predictions. In particular, it offers flexibility for data such as survival data wherein restrictions in alternative models, such as Cox-proportional hazard models, may pose modelling constraints on the data (Ishwaran et al., 2008). Secondly, the research question at hand is inherently a survival problem. In order to obtain an optimal risk score that best predicts patients' ICU admission, we must use the *status* variable which describes whether a patient has been admitted to ICU or not (0 = no serious event and 1 = serious event/ICU admission). This is identical to a standard survival analysis question with the DV being patients' survival (0 = alive, 1 = death). Therefore, using a survival random forest offers us a flexible way to handle a survival analysis question without worrying about modelling constraints. 
+
+Since survival random forest was used to train the model for the analysis, the response was also augmented to reflect the change. Instead of using the basic response variable given in the data, the *Status* was modified using survival analysis techniques. In survival analysis, an outcome (DV) is described as time until an event happens, with the event usually being a binary response of yes or no. As for *Status*, a survival object was used to illustrate the time it takes until a patient would be either: admitted to the ICU (Status = 1) or be discharged (Status = 0). In other words, Status was modified to focus how time affects potential risk of patient being admitted into the ICU. 
+
+*Diagnostic:* Random forest is a powerful predictive tool because it is able to make accurate predictions despite the missing values, large number of covariates, and nonlinearity aspect of the models (McAlexander and Mentch, 2020). Consequently, there are no formal assumptions for random forests (Richmond, 2016). This does not mean, however, that random forest works perfectly in every scenarios. For example, although random forest-based models handle multicollinearity sufficiently well (Chowdhury et al., 2021), they can still skew the result if the effect of multicollinearity is strong enough. Therefore, I decided to remove risk score, a highly correlated covariate from the model to prevent the possibility of multicollinearity on the model. 
+Furthermore, out-of-bag error rate was observed to determine the accuracy of the prediction made by the survival random forest. When bootstrapping the data, parts of the observations can be left out of the sampling. The collection of these observations that are unconsidered are known as out-of-bag (OOB) samples. On average, up to 37% of the overall data can be left out as an OOB sample in a single bootstrap (Ishwaran et al., 2008). Much like cross-validation, the OOB samples can be used as the test set to examine the accuracy of the model. OOB error rate is referred to the likelihood of the model failing when OOB sample is used as the test set. For survival random forest specifically, one minus Harrell’s C-index is used to determine the out-of-bag (prediction) error rate (Wright et al., 2021). Harrell’s C-index offers a way measure performance of risk predictions within survival analysis context (Schmid et al., 2016). The C-index is given as 
+
+$C = \frac{\sum_{i,j}I(\widehat{T_i} > \widehat{T_j})\cdot I(\eta_j > \eta_i) \cdot \Delta_j}{\sum_{i,j}I(\widehat{T_i} > \widehat{T_j}) \cdot \Delta_j},  0 \le C \le 1$
+
+Where the numerator represents the number of concordant pairs (when shorter time until event, $T$, is attributed to higher risk score $\eta$) and the denominator represents the sum of concordant pairs and discordant pairs (when shorter time until event, $T$, is attributed to lower risk score $\eta$) (Tay, 2019). Simply put, higher C-index implies the risk score is highly accurate in predicting survival event while C-index closer to 0 implies the risk score is poor in predicting survival event. Therefore, one minus C-index is chosen to represent the out of bag prediction errors for survival random forest.  
+
+```{r echo = FALSE, out.width = "50%", message = FALSE, warning = FALSE}
+set.seed(20)
+
+folds <- 2
+cv_index <- createFolds(factor(data_full_names$status), folds, returnTrain = T)
+
+# # storing results
+# container_model <- vector("list",length(cv_index))
+# container_pred <- container_model
+# 
+# # iterate through cv-folds
+# for(i in 1:length(cv_index)) {
+# 
+#   # define training / test data
+#   train_data <- data_full_names[cv_index[[i]],]
+#   eval_data <- data_full_names[-cv_index[[i]],]
+# 
+#   # train
+#   srf <- ranger(Surv(event_time, status) ~ temperature + age + sex +
+#                    respiration_rate + heart_rate + oxygen_saturation + level_of_consciousness +
+#                    supplementary_oxygen + blood_pressure,
+#                  data = train_data,
+#                  importance = "permutation", verbose = FALSE)
+# 
+#   # prediction
+#   pred <- predict(srf, eval_data)
+# 
+#   # store results
+#   container_model[[i]] <- srf
+#   container_pred[[i]] <- pred
+# }
+# saveRDS(container_model, "container model CV.rds")
+# saveRDS(container_pred, "container pred CV.rds")
+# 
+container_model <- readRDS("container model CV.rds")
+container_pred <- readRDS("container pred CV.rds")
+
+# prediction error curve
+container_pec <- vector("list",length(cv_index))
+
+
+for(i in 1:length(cv_index)) {
+  train_data <- data_full_names[cv_index[[i]], ]
+  eval_data <- data_full_names[-cv_index[[i]], ]
+  
+  times <- intersect(train_data$event_time,eval_data$event_time)
+  times_overlap <- which(container_pred[[i]]$unique.death.times %in% times)
+  
+  model <- list("SRF"=container_pred[[i]]$survival[,times_overlap])
+  
+   prediction_error_curve <-  pec(
+    object = model,
+    formula = Surv(event_time, status) ~ 1, # Kaplan-Meier
+    traindata = train_data,
+    data = eval_data,
+    exact = F,
+    times <- times
+    )
+   
+  container_pec[[i]] <- prediction_error_curve
+}
+
+# plot of the pec comparison
+invisible(lapply(container_pec[1], plot))
+title("Figure 1: Prediction Error Curve for the Survival Random Forest")
+invisible(lapply(container_pec[2], plot))
+```
+
+Although the process in which OOB error rate is obtained is identical to that of cross-validation, OOB is obtained as the forest is built and thus may be prone to possible biases. Therefore, I have conducted a cross-validation to validate the survival random forest post construction. A 2-fold cross-validation was used in reference to a process done by Thomas Gerlach (2018). Due to computational limitation being that the data used was too large, only 2-fold cross-validation was conducted. As seen from figure 1 above, the prediction error comparison between the trained curve and the true curve indicates minimal deviations; implying the predictive performance of the trained model and the reference model are identical. In conclusion, this shows that the survival random forest performs adequately with minimal predictive errors. 
+
+A new risk score was also proposed by taking the complement of the aggregate survival functions (likelihood of not being admitted to the ICU) for each patient at each time stamp. As mentioned above, the survival curves produced from the survival random forest illustrates the patient's chances of survival overtime (figure 2). However, because each observation in the data represents a patient's health statuses at a given *time stamp*, calculating the patient's chances of survival overtime at a specific time stamp would not make sense. Therefore, an aggregate survival chance was computed for each patient at a given time stamp by taking an average of the simulated survival chance overtime for each observation. This was then used to represent the patient's overall chances of survival at given time stamp. The complement (one minus) of the survival chance were then calculated to determine the likelihood of ICU admission (0 = 0% ICU admission & 1 = 100% ICU admission). This choice was made as the pre-existing risk score was illustrated the same way with there being a risk score for each patient at a given time stamp and this similarity would be useful in comparing the two risk scores. To accommodate for the effect of time, several iterations of the survival random forest were run to obtain a new risk score each day (n = 14). For each iteration, only the patients who were still in the hospital at the time were included in the present iteration. For patients who remained in the hospital, their cumulative records (from day 0 to present) were used in risk construction to better track the changes in patient's health over time. 
+
+\newpage
+
+### Result
+
+```{r echo=FALSE, warning=FALSE}
+
+# place the OOB prediction error into a separate table 
+prediction_error <- data.frame(pred_err = numeric(14))
+
+# table for plot
+plot_table <- list()
+
+for (i in 1:14) {
+  # split the data into 14 sub-data based on days stayed on hospital
+  id_sub <- data_etc %>% filter(eventtime_in_days >= i - 1)
+  data_sub <- data_full_names %>% filter( id %in% id_sub$id & event_time <= i)
+  
+  # build a srf using the sub data 
+  rf_ICU_sub <- readRDS(sprintf("rf_%s.rds", i))
+  
+  # insert the prediction error for each srf iteration into the prediction_error table
+  prediction_error[i] <- rf_ICU_sub$prediction.error
+
+  # create an empty column to store average survival curve
+  data_sub[, 'average_survival'] <- NA
+  
+  # impute the average survival curve for each row into the data
+  for (j in 1:nrow(data_sub)) {
+    data_sub$average_survival[j] <- mean(rf_ICU_sub$survival[j,])
+  }
+  
+  # find the average survival function for each patient in the data
+  data_sub <- data_sub %>% mutate(death_chance = 1 - average_survival)
+  data_sub <- data_sub %>% group_by(id) %>% mutate(relative_risk = as.numeric(risk_score)/20)
+  
+  dummy_df <- cbind(red=data_sub$relative_risk, blue=data_sub$death_chance)
+  dummy_df <- melt(dummy_df, id.vars=1:2)
+  # find the average survival function for each patient in the data
+  plot_table[[i]] <- dummy_df %>%
+    ggplot() + 
+    # average risk 
+    geom_freqpoly(aes(x = value, fill = Var2, colour = Var2),  alpha = 0.5, stat = "bin", bins = 30) + 
+    scale_colour_manual(name = "Score Used", values = c("red", "blue"), labels = c("Old Score", "New Score")) + 
+    scale_fill_manual(name = "Score Used", values = c("red", "blue"), labels = c("Old Score", "New Score")) + 
+    xlim(c(0,1)) + labs(x = "Risk Score", y = "Count", fill = "Score Used", title = sprintf("Day %s", i)) 
+  
+}
+
+
+```
+
+*Result:* After building the survival random forest, 7 patients were chosen through judgement sampling technique. The survival curves based on the patient's health status were averaged over the their duration of stay to illustrate the patient's overall risk of being admitted into ICU over time. As seen from figure 2, we can see that some samples illustrate steeper downward trend (indicating that risk of being admitted into ICU increases at a faster rate as time progresses OR the chance of survival decreases as time progresses), but other samples indicate a relatively shallow trend. The average of all simulated responses was also included to observe the overall trend across all patients, and once again we can see that the overall risk of being admitted into ICU increases at a slower rate as time progresses. In other words, the plot suggests that whether a patient is likely going to be admitted into ICU is usually determined during the first couple days, and once this window passes, the patients are not any more likely to be admitted to ICU than before. This phenomenon is consistent with the recorded differences in appendix a; where larger number of patients were admitted into ICU (Status = 1) during the first couple days and as time progressed, there were greater number of patients being discharged (Status = 0) versus patients being admitted into the ICU. 
+
+The OOB prediction error based on Harrell's C-index also revealed that the model is accurate 3/4 times. 
+
+
+```{r echo=FALSE, warning=FALSE, out.width="70%"}
+# creating 7 samples of survival models based on rf
+# creating new dataframe to hold the samples + first sample
+rf_ICU <- readRDS("rf_ICU.rds")
+# 6 samples selected by me (average of survival model of patient n over their duration of stay)
+sample_1 <- sapply(data.frame(rf_ICU$survival[1:73,]), mean)
+sample_2 <- sapply(data.frame(rf_ICU$survival[74:149,]), mean)
+sample_3 <- sapply(data.frame(rf_ICU$survival[150:206,]), mean)
+sample_4 <- sapply(data.frame(rf_ICU$survival[207:279,]), mean)
+sample_11 <- sapply(data.frame(rf_ICU$survival[623:640,]), mean)
+sample_12 <- sapply(data.frame(rf_ICU$survival[641:711,]), mean)
+
+rf_ICU_plot <- data.frame(sample_1, sample_2, sample_3, sample_4, sample_11, sample_12)
+
+# average of all iterations 
+survival_avg <- sapply(data.frame(rf_ICU$survival), mean)
+rf_ICU_plot["average"] <- survival_avg
+
+rownames(rf_ICU_plot) <- rf_ICU$unique.death.times
+rf_ICU_plot <- as.matrix(rf_ICU_plot)
+rf_ICU_plot <- melt(rf_ICU_plot)
+
+# plotting 7 samples & avg (Figure 2)
+rf_ICU_plot %>% ggplot(aes(x = Var1, y = value, color = Var2)) + geom_line()  + 
+  theme(
+  plot.title = element_text(face = "bold")) +
+  labs(title = "Figure 2: Chances of Patient Discharge", x = "Event Time", y = "% of Survival") + 
+  scale_color_manual(name = "Samples",
+                     values = c("#89C5DA", "#DA5724", "#74D944", "#CE50CA", 
+                                "#C0717C", "red","#000000"),
+                     labels = c("Patient 1", "Patient 2", "Patient 3", "Patient 4",
+                                "Patient 11", "Patient 12", "Average"))
+
+```
+
+\newpage
+
+```{r echo = FALSE, warning = FALSE}
+
+# split the data into 12 sub-data based on days stayed on hospital
+data_0to1 <- data_full_names %>% filter(event_time <= 1)
+
+# fitting a random forest with survival analysis as DV
+set.seed(01)
+
+# saves random forest as .rds to reduce run time
+rf_ICU_0to1 <- ranger(Surv(event_time, status) ~ temperature + age + sex +
+                   respiration_rate + heart_rate + oxygen_saturation + level_of_consciousness +
+                   supplementary_oxygen + blood_pressure,
+                 data = data_0to1,
+                 importance = "permutation", verbose = FALSE)
+
+# create an empty column to store average survival curve
+data_0to1[, 'average_survival'] <- NA
+
+# impute the average survival curve for each row into the data
+for (i in 1:nrow(data_0to1)) {
+  data_0to1$average_survival[i] <- mean(rf_ICU_0to1$survival[i,])
+}
+
+# find the average survival function for each patient in the data
+data_0to1 <- data_0to1 %>% mutate(relative_death = 1 - average_survival)
+data_0to1 <- data_0to1 %>% mutate(relative_risk = as.numeric(risk_score)/20)
+data_0to1_sub <- data_0to1 %>% select(id, time, event_time,relative_risk, relative_death)
+colnames(data_0to1_sub) <- c("ID", "Time", "Event Time","Old Score", "New Score")
+
+knitr::kable(data_0to1_sub[1:10,], caption = "Comparison of existing risk score and new risk score",digits=3)
+
+```   
+
+Table 2 compares the existing risk score versus the new risk score. To allow for easier comparison, the existing risk score was converted to proportions to match that of the new risk score by taking the current old score over the highest possible score (20). Figure 3 better illustrates the distributions between two scores. Total of 14 plots are shown, each plot representing a day in the hospital stay. As seen from figure 3, it is clear that the new risk score demonstrate more conservative risk scoring than the existing risk score, with most of the scores clustering below 0.5 risk. We can also observe a similar pattern as figure 2 where the highest risk occurs during the first couple days and the overall risk of admission decreasing overtime. 
+
+```{r,  eval = FALSE, echo = FALSE, out.width="50%", warning=FALSE, message=FALSE}
+# FIGURE 3
+plot1 <- ggarrange(plot_table[[1]], plot_table[[2]], plot_table[[3]], plot_table[[4]], plot_table[[5]], plot_table[[6]], plot_table[[7]], plot_table[[8]], plot_table[[9]], plot_table[[10]], plot_table[[11]], plot_table[[12]], plot_table[[13]], plot_table[[14]], common.legend = TRUE, legend = "bottom")
+plot1 <- annotate_figure(plot1, top = text_grob("Figure 3: Old Score vs New Score on Duration of Stay", face = "bold", size = 25))
+
+pdf(sprintf("0001.pdf"), width = 24, height = 16, onefile = T)
+plot1
+dev.off()
+```
+```{r, echo = FALSE, out.width= "100%"}
+include_graphics("0001.jpg")
+```
+
+Another version of the risk score used isolated records of the patients restricted within that day as opposed to cumulative records in figure 3 to check for differences if only the records for that day were used to build the model. The result (shown in appendix g) illustrated a relatively similar trend as figure 3 which shows that either methods are viable. Figure 3 was chosen in the end, however, as the OOB predictive errors were much more robust in this version of the model as seen from table 3. 
+
+```{r, echo = FALSE}
+# prediction error table
+colnames(prediction_error) <- c("Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7", 
+                                "Day 8", "Day 9", "Day 10", "Day 11", "Day 12", "Day 13", "Day 14")
+knitr::kable(prediction_error[1,], caption = "Prediction errors for each iteration of the model", digits = 3)
+```
+
+Figure 4 illustrates which covariates are considered significant predictors of ICU admission. Typically, when a random forest is built, it ranks the covariates from the highest predictive power to the lowest. Figure 4 shows all variables of importance for each iteration of the model. From this we see that temperature is the most significant contributor to the model prediction at all times. This is followed by oxygen saturation, but age overtakes oxygen saturation in subsequent days. Heart rate and respiration rate also become more prevalent in later iterations of the model. 
+
+```{r, eval = FALSE, echo = FALSE, out.width="50%"}
+# table for varimports
+varimport_table <- list()
+
+for (i in 1:14) {
+  # split the data into 14 sub-data based on days stayed on hospital
+  id_sub <- data_etc %>% filter(eventtime_in_days >= i - 1)
+  data_sub <- data_full_names %>% filter( id %in% id_sub$id & event_time <= i)
+  
+  # build a srf using the sub data 
+  rf_ICU_sub <- readRDS(sprintf("rf_%s.rds", i))
+
+
+  # variable of importance for each iteration of srf
+  varImport <- data.frame(sort(round(rf_ICU_sub$variable.importance, 4), decreasing = TRUE))
+  varImport <- tibble::rownames_to_column(varImport) 
+  colnames(varImport) <- c("condition", "value")
+  
+  varimport_table[[i]] <- varImport %>% ggplot(aes(x = reorder(condition, value), y = value)) + geom_bar(stat = "identity", fill = "#DC7CA5") +
+    coord_flip() + labs(title = sprintf("Day %s", i),  
+               y = "Mean Decrease Accuracy", x = "Covariates")
+
+}
+
+varimport_table[[1]]$data$condition <- c("Temperature", "Oxygen Saturation", "Blood Pressure", "Heart Rate", "Age", "Respiration Rate", "Sex", "Level of Consciousness", "Supplementary Oxygen") 
+varimport_table[[2]]$data$condition <- c("Temperature", "Oxygen Saturation", "Age", "Heart Rate", "Blood Pressure", "Respiration Rate", "Level of Consciousness", "Supplementary Oxygen", "Sex")
+varimport_table[[3]]$data$condition <- c("Temperature", "Oxygen Saturation", "Age", "Heart Rate", "Blood Pressure", "Respiration Rate", "Level of Consciousness", "Supplementary Oxygen", "Sex")
+varimport_table[[4]]$data$condition <- c("Temperature", "Oxygen Saturation", "Age", "Heart Rate", "Blood Pressure", "Respiration Rate", "Level of Consciousness", "Supplementary Oxygen", "Sex")
+varimport_table[[5]]$data$condition <- c("Temperature", "Age", "Oxygen Saturation", "Heart Rate", "Level of Consciousness", "Blood Pressure", "Supplementary Oxygen", "Respiration Rate", "Sex")
+varimport_table[[6]]$data$condition <- c("Temperature", "Age", "Heart Rate",  "Oxygen Saturation",  "Respiration Rate", "Level of Consciousness", "Supplementary Oxygen", "Blood Pressure", "Sex")
+varimport_table[[7]]$data$condition <- c("Temperature", "Age", "Heart Rate",  "Oxygen Saturation",  "Respiration Rate", "Level of Consciousness", "Supplementary Oxygen", "Blood Pressure", "Sex")
+varimport_table[[8]]$data$condition <- c("Temperature", "Age", "Heart Rate",  "Oxygen Saturation",  "Respiration Rate", "Level of Consciousness", "Supplementary Oxygen", "Blood Pressure", "Sex")
+varimport_table[[9]]$data$condition <- c("Temperature", "Age", "Heart Rate",  "Oxygen Saturation",  "Respiration Rate", "Level of Consciousness", "Supplementary Oxygen", "Sex", "Blood Pressure")
+varimport_table[[10]]$data$condition <- c("Temperature", "Age", "Heart Rate",  "Oxygen Saturation",  "Respiration Rate", "Supplementary Oxygen", "Level of Consciousness", "Sex", "Blood Pressure")
+varimport_table[[11]]$data$condition <- c("Temperature", "Age", "Respiration Rate", "Heart Rate", "Oxygen Saturation",  "Level of Consciousness", "Sex", "Supplementary Oxygen", "Blood Pressure")
+varimport_table[[12]]$data$condition <- c("Temperature", "Age", "Respiration Rate", "Oxygen Saturation", "Heart Rate", "Level of Consciousness", "Sex", "Supplementary Oxygen", "Blood Pressure")
+varimport_table[[13]]$data$condition <- c("Age", "Temperature", "Respiration Rate", "Heart Rate", "Oxygen Saturation", "Sex", "Level of Consciousness",  "Supplementary Oxygen", "Blood Pressure")
+varimport_table[[14]]$data$condition <- c("Age", "Temperature", "Sex", "Heart Rate", "Oxygen Saturation", "Supplementary Oxygen", "Respiration Rate", "Level of Consciousness", "Blood Pressure")
+
+# FIGURE 4
+plot2 <- ggarrange(varimport_table[[1]], varimport_table[[2]], varimport_table[[3]], varimport_table[[4]], varimport_table[[5]], varimport_table[[6]], varimport_table[[7]], varimport_table[[8]], varimport_table[[9]], varimport_table[[10]], varimport_table[[11]], varimport_table[[12]], varimport_table[[13]], varimport_table[[14]])
+plot2 <- annotate_figure(plot2, top = text_grob("Figure 4: Variables of Importance", face = "bold", size = 25))
+
+pdf(sprintf("0002.pdf"), width = 24, height = 16, onefile = T)
+plot2
+dev.off()
+```
+
+```{r echo = FALSE, out.width = "100%"}
+include_graphics("0002.jpg")
+```
+
+\newpage 
+
+### Discussion
+
+So far, we have shown in our report a newly proposed model simulating patients' risk of ICU admission over time and we have also tested the model validity using methods such as cross-validation and OOB prediction errors. A simple illustration of the simulated survival curves have also shown to be consistent with our data as shown in appendix a and figure 3. Next, a new risk score was proposed using the complement of an aggregated survival function to represent the chances of ICU admission (table 2). As mentioned earlier, while the newly proposed risk score does illustrate a milder risk than its former, its validity can be assured as seen from their prediction errors (table 3). We see that the models can accurately predict 53% to 93% of the data with their accuracies increasing with each iteration. As of its current version, the risk score can be used as a substitute of the old risk score given their similarities. Since the new risk score is stored within the data of their respective n-th iteration, the health experts only need to access the data containing the n-th iteration to obtain patients' risk score at day *n*. This method is also efficient as the risk construction is mostly done by the survival random forest automatically and thus the health experts only need to use the given risk score from the table without further modification. 
+
+With regards to the variables of importance, we can see that temperature, age, oxygen saturation, heart rate, and respiration rate are the five most important contributors predicting the risk of a patient being admitted into the ICU. This result in figure 4 is consistent with the plots from appendix b, c, e, and f as seen from the noticeable differences between patients admitted into ICU and patients not admitted into ICU within these health statuses. It also makes intuitive sense that age will play a part in predicting patient’s likelihood of ICU admission as we expect older patients to be at higher risk of experiencing a serious event than younger patients.
+
+However, the newly proposed risk score is not without its limitations. Most noticeable challenge with the new risk score is that the majority of the calculated risk scores do not exceed 0.5. Although the existing risk score can be seen to exceed this threshold, this is not the case for the new risk score. This can be problematic as the risk score may incorrectly classify at-risk patients as low risk. One reason why this is occurring may be due to the averaging effect when the survival functions are aggregated. As explained earlier, the survival functions are averaged over time to illustrate an overall survival chance at a given time stamp. However, the problem with averages/summary statistics is that they tend to oversimplify the end result as it is illustrated as a point estimate. Therefore, future replications of the study may observe more accurate results by using an estimate that better captures true risk such as an interval estimate.
+
+\newpage 
+
+### References
+
+Chowdhury, S., Lin, Y., Liaw, B., &amp; Kerbyd, L. (2021, November 5). *Evaluation of Tree Based Regression over Multiple Linear Regression for Non-normally Distributed Data in Battery Performance*. Retrieved February 7, 2022, from https://arxiv.org/pdf/2111.02513.pdf 
+
+Mogensen UB, Ishwaran H, Gerds TA.*Evaluating Random Forests for Survival Analysis using Prediction Error Curves*. J Stat Softw. 2012;50(11):1-23. doi:10.18637/jss.v050.i11
+
+McAlexander, R. J., & Mentch, L. (2020). *Predictive inference with random forests: A new perspective on classical analyses*. Research & Politics. https://doi.org/10.1177/2053168020905487
+
+Richmond, S. (2016, March 21). *Algorithms exposed: Random Forest*. BCCVL. Retrieved February 7, 2022. 
+
+Rickert, J. (2017, September 25). *Survival analysis with R*. R Views. Retrieved February 7, 2022, from https://rviews.rstudio.com/2017/09/25/survival-analysis-with-r/ 
+
+Hemant Ishwaran, Udaya B. Kogalur, Eugene H. Blackstone, Michael S. Lauer "Random survival forests," *The Annals of Applied Statistics, Ann. Appl. Stat*. 2(3), 841-860, (September 2008)
+
+Gerlach, T. (2018). Random survival forest example, R, Package Ranger. GithubGist. Retrieved March 18, 2022, from https://gist.github.com/thomasmooon/6eb87964ea663f4a7441cc2b2b730bd4 
+
+Tay, K. (2019, October 26). What is Harrell's C-index? Statistical Odds &amp; Ends. Retrieved April 6, 2022, from https://statisticaloddsandends.wordpress.com/2019/10/26/what-is-harrells-c-index/ 
+
+Schmid, M., Wright, M. N., &amp; Ziegler, A. (2016). On the use of Harrell’s C for clinical risk prediction via random survival forests. Expert Systems with Applications, 63, 450–459. https://doi.org/10.1016/j.eswa.2016.07.018 
+
+\newpage
+
+### Appendix
+
+```{r echo = FALSE, out.width="50%", warning = FALSE}
+# Appendix A based on when the the patient is admitted into ICU or discharged
+suppressMessages(data_etc %>% ggplot(aes(x = eventtime_in_days, fill = as.character(status))) + geom_histogram(bins=30) + theme(
+  plot.title = element_text(face = "bold")) +
+  labs(title = "Appendix a: ICU Admission/Discharges Overtime", x = "Event Time", y = "Count") + 
+  scale_fill_manual(name = "Status",  values = c("#7A7C80", "#DC7CA5"), labels = c("Not Serious", "ICU"))
+)
+
+#age vs status
+suppressMessages(data_etc %>% group_by(Agebaseline_years) %>%
+  ggplot(aes(x = Agebaseline_years, fill = as.factor(status))) + geom_histogram(bins=30) +
+  theme(plot.title = element_text(face = "bold")) + 
+  labs(title = "Appendix d: Age vs Status", x = "Age", y = "Count", fill = "Status")) + 
+  scale_fill_manual(name = "Status",  values = c("#7A7C80", "#DC7CA5"), labels = c("Not Serious", "ICU"))
+```
+
+```{r echo = FALSE, message = FALSE, out.width="50%"}
+#temperature changes over time compared to status
+suppressMessages(data_full_names) %>%
+  ggplot(aes(x = event_time, y = temperature, colour = as.factor(status))) + geom_smooth() +
+  theme(plot.title = element_text(face = "bold")) + 
+  labs(title = "Appendix b: Temperature Changes over Time", x = "event time", y = "Temperature", colour = "Status") + 
+  scale_colour_manual(name = "Status",  values = c("#7A7C80", "#DC7CA5"), labels = c("Not Serious", "ICU"))
+
+# respiration rate vs status
+data_full_names %>%
+  ggplot(aes(x = event_time, y = respiration_rate, colour = as.factor(status))) + 
+  geom_smooth() +
+  theme(plot.title = element_text(face = "bold")) + 
+  labs(title = "Appendix c: Respiration Rate over Time", x = "event time", y = "Respiration Rate", colour = "Status") + 
+  scale_colour_manual(name = "Status",  values = c("#7A7C80", "#DC7CA5"), labels = c("Not Serious", "ICU"))
+
+# oxygen saturation vs status
+data_full_names %>%
+  ggplot(aes(x = event_time, y = oxygen_saturation, colour = as.factor(status))) + 
+  geom_smooth() +
+  theme(plot.title = element_text(face = "bold")) + 
+  labs(title = "Appendix e: Oxygen Saturation over Time", x = "event time", y = "Oxygen Saturation", colour = "Status") + 
+  scale_colour_manual(name = "Status",  values = c("#7A7C80", "#DC7CA5"), labels = c("Not Serious", "ICU"))
+
+# heart rate rate vs status
+data_full_names %>%
+  ggplot(aes(x = event_time, y = heart_rate, colour = as.factor(status))) + 
+  geom_smooth() +
+  theme(plot.title = element_text(face = "bold")) + 
+  labs(title = "Appendix f: Heart Rate over Time", x = "event time", y = "Heart Rate", colour = "Status") + 
+  scale_colour_manual(name = "Status",  values = c("#7A7C80", "#DC7CA5"), labels = c("Not Serious", "ICU"))
+```
+
+```{r, eval = FALSE, echo = FALSE, out.width="50%", Warning = FALSE, message= FALSE}
+
+# place the OOB prediction error into a separate table 
+prediction_error2 <- data.frame(pred_err = numeric(14))
+
+# table for plot
+plot_table_ind <- list()
+
+# table for varimports
+varimport_table <- list()
+
+for (i in 1:13) {
+  # split the data into 14 sub-data based on days stayed on hospital
+  data_sub <- data_full_names %>% filter(event_time  > i & event_time <= i + 1)
+  
+  # build a srf using the sub data 
+  rf_ICU_sub <- ranger(Surv(event_time, status) ~ temperature + age + sex +
+                   respiration_rate + heart_rate + oxygen_saturation + level_of_consciousness +
+                   supplementary_oxygen + blood_pressure,
+                 data = data_sub,
+                 importance = "permutation", verbose = FALSE)
+  
+  # insert the prediction error for each srf iteration into the prediction_error table
+  prediction_error2[i] <- rf_ICU_sub$prediction.error
+
+  # create an empty column to store average survival curve
+  data_sub[, 'average_survival'] <- NA
+  
+  # impute the average survival curve for each row into the data
+  for (j in 1:nrow(data_sub)) {
+    data_sub$average_survival[j] <- mean(rf_ICU_sub$survival[j,])
+  }
+  
+  # find the average survival function for each patient in the data
+  data_sub <- data_sub %>% mutate(death_chance = 1 - average_survival)
+  data_sub <- data_sub %>% group_by(id) %>% mutate(relative_risk = as.numeric(risk_score)/20)
+  
+  dummy_df <- cbind(red=data_sub$relative_risk, blue=data_sub$death_chance)
+  dummy_df <- melt(dummy_df, id.vars=1:2)
+  # find the average survival function for each patient in the data
+  plot_table_ind[[i]] <- dummy_df %>%
+    ggplot() + 
+    # average risk 
+    geom_freqpoly(aes(x = value, fill = Var2, colour = Var2),  alpha = 0.5, stat = "bin", bins = 30) + 
+    scale_colour_manual(name = "Score Used", values = c("red", "blue"), labels = c("Old Score", "New Score")) + 
+    scale_fill_manual(name = "Score Used", values = c("red", "blue"), labels = c("Old Score", "New Score")) + 
+    xlim(c(0,1)) + labs(x = "Risk Score", y = "Count", fill = "Score Used", title = sprintf("Day %s", i)) 
+  
+}
+
+# APPENDIX G
+plot3 <- suppressMessages(ggarrange(plot_table_ind[[1]], plot_table_ind[[2]], plot_table_ind[[3]], plot_table_ind[[4]], plot_table_ind[[5]], plot_table_ind[[6]], plot_table_ind[[7]], plot_table_ind[[8]], plot_table_ind[[9]], plot_table_ind[[10]], plot_table_ind[[11]], plot_table_ind[[12]], plot_table_ind[[13]], common.legend = TRUE, legend = "bottom"))
+plot3 <- annotate_figure(plot3, top = text_grob("Appendix g: Old Score vs New Score on Duration of Stay (not cumulative)", face = "bold", size = 25))
+pdf(sprintf("0003.pdf"), width = 24, height = 16, onefile = T)
+plot3
+dev.off()
+```
+
+```{r, echo = FALSE, out.width= "100%"}
+include_graphics("0003.jpg")
+```
+
+
+
+
